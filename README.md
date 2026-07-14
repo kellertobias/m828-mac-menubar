@@ -1,6 +1,8 @@
-# Menubar Native Control
+# M828 Mac Menu Bar
 
 Native macOS/AppKit menu bar controller for a MOTU 828ES or another AVB mixer with HTTP-accessible control endpoints.
+
+![M828 Mac Menu Bar screenshot](screenshot.png)
 
 ## What It Does
 
@@ -15,7 +17,7 @@ Native macOS/AppKit menu bar controller for a MOTU 828ES or another AVB mixer wi
 
 ## Build And Run
 
-This project is a Swift Package so it can build without an Xcode project:
+This project is a Swift Package, so it can build without an Xcode project:
 
 ```sh
 swift run MenubarNativeControl
@@ -112,3 +114,7 @@ meters/mix/level/5/14
 ```
 
 Meter values are normalized from MOTU's `0...1000` response scale to the app's `0...1` level indicator scale.
+
+## License
+
+M828 Mac Menu Bar is released under the MIT License. See [LICENSE](LICENSE).
