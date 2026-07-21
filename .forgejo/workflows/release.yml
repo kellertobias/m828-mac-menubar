@@ -41,7 +41,11 @@ jobs:
           git config user.email "ci@tokenet.de"
           node Scripts/set-version.mjs "$VERSION"
           git add VERSION
-          git commit -m "chore(release): v$VERSION [skip ci]"
+          # No [skip ci] marker: the v* tag points at this commit, and GitHub Actions
+          # honors [skip ci] on a tag's target commit, which would skip the mirrored
+          # tag build. Re-triggering this job on the release commit is a harmless no-op
+          # because next-version.mjs finds no commits since the freshly-created tag.
+          git commit -m "chore(release): v$VERSION"
           git tag -a "v$VERSION" -m "v$VERSION"
           git push origin HEAD:main
           git push origin "v$VERSION"
