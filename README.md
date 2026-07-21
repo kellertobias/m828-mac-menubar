@@ -15,6 +15,35 @@ Native macOS/AppKit menu bar controller for a MOTU 828ES or another AVB mixer wi
   - building the menu manually from sections and source-backed elements,
   - auto-start through macOS login items.
 
+## Install
+
+The app is a **universal build** (Apple Silicon + Intel) and is **unsigned** — it is ad-hoc signed but not notarized, because there is no Apple Developer account. It requires **macOS 13 (Ventura) or newer**.
+
+### Download
+
+Download the latest `Menubar-Native-Control-<version>-macos-universal.zip` from the [Releases page](https://github.com/kellertobias/m828-mac-menubar/releases/latest), unzip it, and move **Menubar Native Control.app** to `/Applications`. Because the download is quarantined and not notarized, macOS Gatekeeper blocks the first launch until you clear the quarantine flag:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Menubar Native Control.app"
+```
+
+### Homebrew
+
+The cask downloads the same prebuilt release, then clears quarantine and re-signs the app locally, so it launches with no Gatekeeper prompt and no manual step:
+
+```sh
+brew tap kellertobias/m828-mac-menubar https://github.com/kellertobias/m828-mac-menubar.git
+brew trust --cask kellertobias/m828-mac-menubar/menubar-native-control
+brew install --cask kellertobias/m828-mac-menubar/menubar-native-control
+```
+
+`brew trust` is only required if you run Homebrew with `HOMEBREW_REQUIRE_TAP_TRUST` set; it is harmless otherwise. The cask tracks the newest release (`version :latest`), so `brew upgrade` does **not** detect new versions — update with:
+
+```sh
+brew update
+brew reinstall --cask kellertobias/m828-mac-menubar/menubar-native-control
+```
+
 ## Build And Run
 
 This project is a Swift Package, so it can build without an Xcode project:
@@ -86,13 +115,7 @@ node Scripts/next-version.mjs   # prints the next version, or nothing if no rele
 - Forgejo secret **`SEMANTIC_RELEASE_TOKEN`** with `write:repository` scope (pushes the release commit and tag; the default job token is not sufficient for protected `main`).
 - GitHub uses the built-in `GITHUB_TOKEN` (the release job has `contents: write`) — no extra secret needed.
 
-### Installing a release (unsigned app)
-
-The app is **unsigned** (no Apple Developer account), so Gatekeeper quarantines the download. After moving it to `/Applications`:
-
-```sh
-xattr -dr com.apple.quarantine "/Applications/Menubar Native Control.app"
-```
+The published artifacts are a per-version `Menubar-Native-Control-<version>-macos-universal.zip` plus a stable `Menubar-Native-Control-macos-universal.tar.gz` that always points at the newest release (consumed by the Homebrew cask). See [Install](#install) for how to get and run them.
 
 ## Endpoint Configuration
 

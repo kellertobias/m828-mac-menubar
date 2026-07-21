@@ -50,10 +50,17 @@ jobs:
           APP_NAME="Menubar Native Control"
           APP_PATH=".build/$APP_NAME.app"
           ZIP_NAME="Menubar-Native-Control-${VERSION}-macos-universal.zip"
+          # Stable, version-less tarball so the Homebrew cask can pull it via
+          # /releases/latest/download/ without knowing the version. (A .tar.gz,
+          # not a .zip, so `brew style`'s GitHub-zipball rule stays happy.)
+          STABLE_TGZ="Menubar-Native-Control-macos-universal.tar.gz"
           test -d "$APP_PATH"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_NAME"
           shasum -a 256 "$ZIP_NAME" > "$ZIP_NAME.sha256"
+          COPYFILE_DISABLE=1 tar -czf "$STABLE_TGZ" -C .build "$APP_NAME.app"
+          shasum -a 256 "$STABLE_TGZ" > "$STABLE_TGZ.sha256"
           echo "zip=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "stable_tgz=$STABLE_TGZ" >> "$GITHUB_OUTPUT"
 
       - name: Compose release notes
         id: notes
@@ -86,16 +93,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           ZIP: ${{ steps.package.outputs.zip }}
+          STABLE_TGZ: ${{ steps.package.outputs.stable_tgz }}
         run: |
           set -euo pipefail
           # Idempotent: a re-run of the tag build updates the existing release and
           # its assets instead of failing because the release already exists.
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
-            gh release upload "$TAG" "$ZIP" "$ZIP.sha256" --clobber
+            gh release upload "$TAG" \
+              "$ZIP" "$ZIP.sha256" \
+              "$STABLE_TGZ" "$STABLE_TGZ.sha256" --clobber
           else
             gh release create "$TAG" \
               --title "$TAG" \
               --notes-file release-notes.md \
-              "$ZIP" "$ZIP.sha256"
+              "$ZIP" "$ZIP.sha256" \
+              "$STABLE_TGZ" "$STABLE_TGZ.sha256"
           fi
