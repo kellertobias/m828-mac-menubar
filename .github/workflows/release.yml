@@ -80,10 +80,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          ZIP: ${{ steps.package.outputs.zip }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes-file release-notes.md \
-            "${{ steps.package.outputs.zip }}" \
-            "${{ steps.package.outputs.zip }}.sha256"
+          # Idempotent: a re-run of the tag build updates the existing release and
+          # its assets instead of failing because the release already exists.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
+            gh release upload "$TAG" "$ZIP" "$ZIP.sha256" --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              "$ZIP" "$ZIP.sha256"
+          fi
