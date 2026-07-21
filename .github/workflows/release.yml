@@ -1,0 +1,81 @@
+name: Release
+
+# The canonical repository lives on Forgejo, which owns tests + versioning and pushes
+# the v* tag (see .forgejo/workflows/release.yml). That tag is push-mirrored to GitHub
+# and triggers this workflow, which builds the macOS app on Apple Silicon and publishes
+# a GitHub Release. The app is unsigned (no Apple Developer account).
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14 # GitHub-hosted Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Swift toolchain
+        run: swift --version
+
+      - name: Build and package the app
+        run: ./build archive
+
+      - name: Create distributable archive
+        id: package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          APP_NAME="Menubar Native Control"
+          APP_PATH=".build/$APP_NAME.app"
+          ZIP_NAME="Menubar-Native-Control-${VERSION}-macos-arm64.zip"
+          test -d "$APP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_NAME"
+          shasum -a 256 "$ZIP_NAME" > "$ZIP_NAME.sha256"
+          echo "zip=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Compose release notes
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          {
+            echo "## Menubar Native Control ${TAG}"
+            echo
+            echo "macOS menubar app for Apple Silicon. **Unsigned** — no Apple Developer account."
+            echo
+            echo "### Install"
+            echo "1. Download and unzip \`${{ steps.package.outputs.zip }}\`."
+            echo "2. Move **Menubar Native Control.app** to /Applications."
+            echo "3. Remove the quarantine flag so Gatekeeper allows it to launch:"
+            echo '   ```sh'
+            echo '   xattr -dr com.apple.quarantine "/Applications/Menubar Native Control.app"'
+            echo '   ```'
+            echo
+            if [ -n "$PREV_TAG" ]; then
+              echo "**Full changelog:** https://github.com/${REPO}/compare/${PREV_TAG}...${TAG}"
+            fi
+          } > release-notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            "${{ steps.package.outputs.zip }}" \
+            "${{ steps.package.outputs.zip }}.sha256"

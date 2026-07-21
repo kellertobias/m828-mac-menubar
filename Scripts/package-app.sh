@@ -9,6 +9,9 @@ APP_DIR="$ROOT_DIR/.build/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 
+# Authoritative version; bumped by the release job via Scripts/set-version.mjs.
+VERSION="$(tr -d '[:space:]' < "$ROOT_DIR/VERSION")"
+
 cd "$ROOT_DIR"
 CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/clang-module-cache" swift build -c release
 
@@ -34,9 +37,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>$VERSION</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>

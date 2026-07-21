@@ -1,0 +1,70 @@
+name: Release
+
+# Semantic release lives here, not on the GitHub mirror: the v* tag is only created
+# once the app has compiled and any tests have passed on main. The GitHub mirror then
+# reacts to the pushed tag (see .github/workflows/release.yml) to build and publish
+# the macOS app.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: release-${{ forgejo.ref }}
+  cancel-in-progress: ${{ forgejo.ref != 'refs/heads/main' }}
+
+jobs:
+  # The authoritative test suite for the AppKit app runs on a real macOS runner.
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - name: Swift toolchain
+        run: swift --version
+      - name: Build
+        run: swift build --configuration release
+      - name: Test
+        run: |
+          if [ -d Tests ]; then
+            swift test
+          else
+            echo "No Tests directory yet; skipping swift test."
+          fi
+
+  # Runs only on trusted pushes to main. Computes the next version from Conventional
+  # Commits, bumps VERSION, commits, then creates and pushes the annotated v* tag.
+  release:
+    needs: [build]
+    if: forgejo.ref == 'refs/heads/main' && forgejo.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+      - uses: https://code.forgejo.org/actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Determine next version from Conventional Commits
+        id: version
+        run: echo "value=$(node Scripts/next-version.mjs)" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and push the release
+        if: steps.version.outputs.value != ''
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          git config user.name "Forgejo CI"
+          git config user.email "ci@tokenet.de"
+          node Scripts/set-version.mjs "$VERSION"
+          git add VERSION
+          git commit -m "chore(release): v$VERSION [skip ci]"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin HEAD:main
+          git push origin "v$VERSION"
+
+      - name: Report no release
+        if: steps.version.outputs.value == ''
+        run: echo "No release-worthy commits since the last tag."

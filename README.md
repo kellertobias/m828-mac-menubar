@@ -57,6 +57,43 @@ INSTALL_DIR="$HOME/Applications" ./build archive install
 
 Auto-start works best from the packaged app, because macOS login item registration expects an application bundle.
 
+## Releases
+
+Releases are fully automated from [Conventional Commits](https://www.conventionalcommits.org/). Two providers cooperate:
+
+- **Forgejo** (`git.tokenet.de`, canonical) owns tests and versioning. On every push to `main`, [`.forgejo/workflows/release.yml`](.forgejo/workflows/release.yml) builds the app on a macOS runner, then — if there are release-worthy commits — bumps [`VERSION`](VERSION), commits `chore(release): vX.Y.Z [skip ci]`, and creates and pushes the annotated `vX.Y.Z` tag.
+- **GitHub** (push mirror) reacts to that tag. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds the app on Apple Silicon, packages it, and publishes a GitHub Release with the `.app` archive plus a SHA-256 checksum.
+
+### Version mapping
+
+| Commit type | Release |
+| --- | --- |
+| `fix:`, `perf:`, `revert:` | patch (`x.y.Z`) |
+| `feat:` | minor (`x.Y.0`) |
+| `<type>!:` or a `BREAKING CHANGE:` footer | major (`X.0.0`) |
+| `docs:`, `test:`, `style:`, `refactor:`, `build:`, `ci:`, `chore:` | no release |
+
+`VERSION` is the single authoritative source; `Scripts/package-app.sh` reads it into the app bundle's `CFBundleShortVersionString`/`CFBundleVersion`. The first automated release is `1.0.0`.
+
+Preview the next version without releasing anything:
+
+```sh
+node Scripts/next-version.mjs   # prints the next version, or nothing if no release is due
+```
+
+### Setup requirements
+
+- Forgejo secret **`SEMANTIC_RELEASE_TOKEN`** with `write:repository` scope (pushes the release commit and tag; the default job token is not sufficient for protected `main`).
+- GitHub uses the built-in `GITHUB_TOKEN` (the release job has `contents: write`) — no extra secret needed.
+
+### Installing a release (unsigned app)
+
+The app is **unsigned** (no Apple Developer account), so Gatekeeper quarantines the download. After moving it to `/Applications`:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Menubar Native Control.app"
+```
+
 ## Endpoint Configuration
 
 Endpoint fields accept either relative paths against the mixer host or full URLs.
