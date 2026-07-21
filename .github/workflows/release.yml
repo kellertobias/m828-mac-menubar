@@ -1,9 +1,12 @@
 name: Release
 
-# The canonical repository lives on Forgejo, which owns tests + versioning and pushes
-# the v* tag (see .forgejo/workflows/release.yml). That tag is push-mirrored to GitHub
-# and triggers this workflow, which builds the macOS app on Apple Silicon and publishes
-# a GitHub Release. The app is unsigned (no Apple Developer account).
+# The canonical repository lives on Forgejo, which owns versioning and pushes the v*
+# tag (see .forgejo/workflows/release.yml). That tag is push-mirrored to GitHub and
+# triggers this workflow. It builds the app as a universal binary (Apple Silicon +
+# Intel) and, only if the build succeeds, publishes a GitHub Release. A macOS runner is
+# required because the app links AppKit, which is unavailable outside the macOS SDK;
+# GitHub-hosted macOS runners need no self-managed infrastructure. The app is unsigned
+# (no Apple Developer account).
 
 on:
   push:
@@ -24,8 +27,13 @@ jobs:
       - name: Swift toolchain
         run: swift --version
 
-      - name: Build and package the app
+      - name: Build and package the app (universal arm64 + x86_64)
+        env:
+          MACOS_UNIVERSAL: "1"
         run: ./build archive
+
+      - name: Verify universal binary
+        run: lipo -archs ".build/Menubar Native Control.app/Contents/MacOS/MenubarNativeControl"
 
       - name: Create distributable archive
         id: package
@@ -36,7 +44,7 @@ jobs:
           VERSION="${TAG#v}"
           APP_NAME="Menubar Native Control"
           APP_PATH=".build/$APP_NAME.app"
-          ZIP_NAME="Menubar-Native-Control-${VERSION}-macos-arm64.zip"
+          ZIP_NAME="Menubar-Native-Control-${VERSION}-macos-universal.zip"
           test -d "$APP_PATH"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_NAME"
           shasum -a 256 "$ZIP_NAME" > "$ZIP_NAME.sha256"
@@ -53,7 +61,7 @@ jobs:
           {
             echo "## Menubar Native Control ${TAG}"
             echo
-            echo "macOS menubar app for Apple Silicon. **Unsigned** — no Apple Developer account."
+            echo "Universal macOS menubar app (Apple Silicon + Intel). **Unsigned** — no Apple Developer account."
             echo
             echo "### Install"
             echo "1. Download and unzip \`${{ steps.package.outputs.zip }}\`."

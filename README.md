@@ -61,8 +61,8 @@ Auto-start works best from the packaged app, because macOS login item registrati
 
 Releases are fully automated from [Conventional Commits](https://www.conventionalcommits.org/). Two providers cooperate:
 
-- **Forgejo** (`git.tokenet.de`, canonical) owns tests and versioning. On every push to `main`, [`.forgejo/workflows/release.yml`](.forgejo/workflows/release.yml) builds the app on a macOS runner, then — if there are release-worthy commits — bumps [`VERSION`](VERSION), commits `chore(release): vX.Y.Z [skip ci]`, and creates and pushes the annotated `vX.Y.Z` tag.
-- **GitHub** (push mirror) reacts to that tag. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds the app on Apple Silicon, packages it, and publishes a GitHub Release with the `.app` archive plus a SHA-256 checksum.
+- **Forgejo** (`git.tokenet.de`, canonical) owns versioning only — it never builds the app, so it needs no macOS runners. On every push to `main`, [`.forgejo/workflows/release.yml`](.forgejo/workflows/release.yml) — if there are release-worthy commits — bumps [`VERSION`](VERSION), commits `chore(release): vX.Y.Z [skip ci]`, and creates and pushes the annotated `vX.Y.Z` tag.
+- **GitHub** (push mirror) reacts to that tag. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds the app as a **universal binary** (Apple Silicon + Intel) and, only if the build succeeds, publishes a GitHub Release with the `.app` archive plus a SHA-256 checksum. A macOS runner is required because the app links AppKit; GitHub-hosted `macos-14` covers this with no self-managed infrastructure.
 
 ### Version mapping
 

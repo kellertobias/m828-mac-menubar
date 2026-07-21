@@ -1,41 +1,22 @@
 name: Release
 
-# Semantic release lives here, not on the GitHub mirror: the v* tag is only created
-# once the app has compiled and any tests have passed on main. The GitHub mirror then
-# reacts to the pushed tag (see .github/workflows/release.yml) to build and publish
-# the macOS app.
+# Forgejo owns versioning only — it never builds the macOS app (no macOS runners
+# required here). On a push to main it derives the next version from Conventional
+# Commits, bumps VERSION, commits, and creates and pushes the annotated v* tag.
+# The GitHub push mirror reacts to that tag to build and publish the app
+# (see .github/workflows/release.yml).
 
 on:
   push:
-  pull_request:
+    branches:
+      - main
 
 concurrency:
-  group: release-${{ forgejo.ref }}
-  cancel-in-progress: ${{ forgejo.ref != 'refs/heads/main' }}
+  group: release-main
+  cancel-in-progress: false
 
 jobs:
-  # The authoritative test suite for the AppKit app runs on a real macOS runner.
-  build:
-    runs-on: macos-14
-    steps:
-      - uses: https://code.forgejo.org/actions/checkout@v4
-      - name: Swift toolchain
-        run: swift --version
-      - name: Build
-        run: swift build --configuration release
-      - name: Test
-        run: |
-          if [ -d Tests ]; then
-            swift test
-          else
-            echo "No Tests directory yet; skipping swift test."
-          fi
-
-  # Runs only on trusted pushes to main. Computes the next version from Conventional
-  # Commits, bumps VERSION, commits, then creates and pushes the annotated v* tag.
   release:
-    needs: [build]
-    if: forgejo.ref == 'refs/heads/main' && forgejo.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: https://code.forgejo.org/actions/checkout@v4
