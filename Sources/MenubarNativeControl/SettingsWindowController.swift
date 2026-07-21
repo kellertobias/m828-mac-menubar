@@ -1,27 +1,33 @@
 import AppKit
 
 @MainActor
-final class SettingsWindowController: NSWindowController {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let client: MOTUClient
     private var configuration: AppConfiguration
+    private var sessionBaselineConfiguration: AppConfiguration
 
-    private let contentStack = NSStackView()
+    private let rootStack = NSStackView()
     private let hostField = NSTextField()
     private let meterUpdateRateField = NSTextField()
     private let launchAtLoginButton = NSButton(checkboxWithTitle: "Enable auto-start", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
+    private let menuSummaryLabel = NSTextField(labelWithString: "")
+    private let menuTableView = NSTableView()
+    private var menuItems: [MenuLayoutItem] = []
     private var mixerScanWindowController: MixerScanWindowController?
-    private var menuSectionRows: [MenuSectionRowControls] = []
-    private weak var menuLayoutStack: NSStackView?
-    private weak var menuSummaryLabel: NSTextField?
-    private weak var menuEmptyLabel: NSTextField?
+    private var activePopover: NSPopover?
+    private var autosaveWorkItem: DispatchWorkItem?
+    private var isPopulatingFields = false
+
+    private let menuPasteboardType = NSPasteboard.PasteboardType("com.keller.menubar-native-control.menu-item")
 
     init(client: MOTUClient) {
         self.client = client
         self.configuration = PreferencesStore.shared.load()
+        self.sessionBaselineConfiguration = configuration
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1220, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -29,6 +35,7 @@ final class SettingsWindowController: NSWindowController {
         window.title = "MOTU 828ES Control Settings"
         window.center()
         super.init(window: window)
+        window.delegate = self
         buildContent()
     }
 
@@ -37,9 +44,28 @@ final class SettingsWindowController: NSWindowController {
     }
 
     override func showWindow(_ sender: Any?) {
-        configuration = PreferencesStore.shared.load()
-        rebuildEditableSections()
+        if window?.isVisible != true {
+            beginSettingsSession()
+        }
         super.showWindow(sender)
+    }
+
+    private func beginSettingsSession() {
+        configuration = PreferencesStore.shared.load()
+        sessionBaselineConfiguration = configuration
+        autosaveWorkItem?.cancel()
+        autosaveWorkItem = nil
+        reloadMenuItemsFromConfiguration()
+        populateGeneralFields()
+        statusLabel.stringValue = "Changes apply immediately and persist when this settings window closes."
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        autosaveWorkItem?.cancel()
+        autosaveWorkItem = nil
+
+        stageCurrentSettings(status: "Saved.", normalizeMeterField: true)
+        persistCurrentSettings()
     }
 
     private func buildContent() {
@@ -47,130 +73,146 @@ final class SettingsWindowController: NSWindowController {
             return
         }
 
-        let scrollView = NSScrollView()
-        scrollView.hasVerticalScroller = true
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        rootStack.orientation = .horizontal
+        rootStack.alignment = .top
+        rootStack.distribution = .fill
+        rootStack.spacing = 24
+        rootStack.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 20, right: 22)
+        rootStack.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(rootStack)
 
-        contentStack.orientation = .vertical
-        contentStack.alignment = .leading
-        contentStack.spacing = 18
-        contentStack.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 20, right: 22)
-        contentStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let documentView = NSView()
-        documentView.translatesAutoresizingMaskIntoConstraints = false
-        documentView.addSubview(contentStack)
-        scrollView.documentView = documentView
-        contentView.addSubview(scrollView)
+        let leftPane = makeLeftPane()
+        let rightPane = makeMenuLayoutPane()
+        rootStack.addArrangedSubview(leftPane)
+        rootStack.addArrangedSubview(rightPane)
 
         NSLayoutConstraint.activate([
-            scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: contentView.topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-
-            documentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            contentStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
-            contentStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
-            contentStack.topAnchor.constraint(equalTo: documentView.topAnchor),
-            contentStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor)
+            rootStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            rootStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            rootStack.topAnchor.constraint(equalTo: contentView.topAnchor),
+            rootStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            leftPane.widthAnchor.constraint(equalToConstant: 380)
         ])
 
-        rebuildEditableSections()
+        reloadMenuItemsFromConfiguration()
+        populateGeneralFields()
     }
 
-    private func rebuildEditableSections() {
-        contentStack.arrangedSubviews.forEach { view in
-            contentStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-        menuSectionRows.removeAll()
-        menuLayoutStack = nil
-        menuSummaryLabel = nil
-        menuEmptyLabel = nil
+    private func makeLeftPane() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
 
-        contentStack.addArrangedSubview(makeGeneralSection())
-        contentStack.addArrangedSubview(makeMenuLayoutSection())
-        contentStack.addArrangedSubview(makeActionRow())
+        stack.addArrangedSubview(makeGeneralSection())
+        stack.addArrangedSubview(makeActionRow())
+        return stack
     }
 
     private func makeGeneralSection() -> NSView {
         let stack = sectionStack(title: "Mixer")
 
-        let hostRow = rowStack()
-        hostRow.addArrangedSubview(label("Mixer IP or host", width: 130))
-        hostField.stringValue = configuration.mixerHost
+        let hostLabel = label("Mixer IP or host")
         hostField.placeholderString = "192.168.1.100"
+        hostField.delegate = self
         hostField.translatesAutoresizingMaskIntoConstraints = false
-        hostRow.addArrangedSubview(hostField)
-        hostField.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        hostField.widthAnchor.constraint(equalToConstant: 250).isActive = true
 
         let scanButton = NSButton(title: "Scan Mixer I/O", target: self, action: #selector(scanMixerIO))
         scanButton.bezelStyle = .rounded
-        hostRow.addArrangedSubview(scanButton)
 
         let scanSourcesButton = NSButton(title: "Scan Control Sources", target: self, action: #selector(scanControlSources))
         scanSourcesButton.bezelStyle = .rounded
-        hostRow.addArrangedSubview(scanSourcesButton)
 
-        let meterRow = rowStack()
-        meterRow.addArrangedSubview(label("Meter updates/sec", width: 130))
-        meterUpdateRateField.stringValue = Self.formatMeterUpdateRate(configuration.pollingInterval)
+        let scanRow = rowStack()
+        scanRow.addArrangedSubview(scanButton)
+        scanRow.addArrangedSubview(scanSourcesButton)
+
+        let meterLabel = label("Meter updates/sec")
         meterUpdateRateField.placeholderString = "20"
+        meterUpdateRateField.delegate = self
         meterUpdateRateField.translatesAutoresizingMaskIntoConstraints = false
         meterUpdateRateField.widthAnchor.constraint(equalToConstant: 70).isActive = true
-        meterRow.addArrangedSubview(meterUpdateRateField)
         let meterHint = NSTextField(labelWithString: "Default 20. Minimum 20. Meters update only while the menu is open.")
         meterHint.font = .systemFont(ofSize: 12)
         meterHint.textColor = .secondaryLabelColor
-        meterRow.addArrangedSubview(meterHint)
+        meterHint.lineBreakMode = .byWordWrapping
+        meterHint.maximumNumberOfLines = 0
+        meterHint.translatesAutoresizingMaskIntoConstraints = false
+        meterHint.widthAnchor.constraint(equalToConstant: 285).isActive = true
 
-        launchAtLoginButton.state = configuration.launchAtLogin ? .on : .off
         launchAtLoginButton.target = self
         launchAtLoginButton.action = #selector(launchAtLoginChanged(_:))
 
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.lineBreakMode = .byWordWrapping
+        statusLabel.maximumNumberOfLines = 0
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.widthAnchor.constraint(equalToConstant: 330).isActive = true
         statusLabel.stringValue = "Endpoint fields accept relative paths, absolute URLs, or URL templates containing {value}."
 
-        stack.addArrangedSubview(hostRow)
-        stack.addArrangedSubview(meterRow)
+        stack.addArrangedSubview(hostLabel)
+        stack.addArrangedSubview(hostField)
+        stack.addArrangedSubview(scanRow)
+        stack.addArrangedSubview(meterLabel)
+        stack.addArrangedSubview(meterUpdateRateField)
+        stack.addArrangedSubview(meterHint)
         stack.addArrangedSubview(launchAtLoginButton)
         stack.addArrangedSubview(statusLabel)
         return stack
     }
 
-    private func makeMenuLayoutSection() -> NSView {
+    private func makeMenuLayoutPane() -> NSView {
         let stack = sectionStack(title: "Menu Layout")
-        menuLayoutStack = stack
-        let sourceControlCount = configuration.controlSources.reduce(0) { $0 + $1.controls.count }
-        let configuredControlCount = configuration.controlSections.reduce(0) { $0 + $1.controls.count }
-        let summary = NSTextField(labelWithString: configuration.controlSources.isEmpty
-            ? "No control sources scanned. Scan sources, then add the sections and controls you want in the menu."
-            : "\(configuration.controlSources.count) sources and \(sourceControlCount) controls available. \(configuredControlCount) controls are currently placed in the menu.")
-        summary.textColor = .secondaryLabelColor
-        summary.font = .systemFont(ofSize: 12)
-        menuSummaryLabel = summary
-        stack.addArrangedSubview(summary)
+        stack.alignment = .leading
+        stack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        stack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        menuSummaryLabel.textColor = .secondaryLabelColor
+        menuSummaryLabel.font = .systemFont(ofSize: 12)
+        menuSummaryLabel.lineBreakMode = .byWordWrapping
+        menuSummaryLabel.maximumNumberOfLines = 0
+        stack.addArrangedSubview(menuSummaryLabel)
+
+        let buttonRow = rowStack()
         let addSectionButton = NSButton(title: "Add Section", target: self, action: #selector(addMenuSection))
         addSectionButton.bezelStyle = .rounded
-        let buttonRow = rowStack()
+        let addControlButton = NSButton(title: "Add Control", target: self, action: #selector(addMenuControl))
+        addControlButton.bezelStyle = .rounded
         buttonRow.addArrangedSubview(addSectionButton)
+        buttonRow.addArrangedSubview(addControlButton)
         stack.addArrangedSubview(buttonRow)
 
-        if configuration.controlSections.isEmpty {
-            let emptyLabel = makeMenuLayoutEmptyLabel()
-            menuEmptyLabel = emptyLabel
-            stack.addArrangedSubview(emptyLabel)
-        }
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .bezelBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        for section in configuration.controlSections {
-            let row = MenuSectionRowControls(section: section, sources: configuration.controlSources)
-            addMenuSectionRow(row)
-        }
-        updateMenuLayoutSummary()
+        let column = NSTableColumn(identifier: .menuItemColumn)
+        column.resizingMask = .autoresizingMask
+        column.minWidth = 560
+        column.width = 680
+        menuTableView.addTableColumn(column)
+        menuTableView.headerView = nil
+        menuTableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        menuTableView.rowHeight = 52
+        menuTableView.intercellSpacing = NSSize(width: 0, height: 1)
+        menuTableView.dataSource = self
+        menuTableView.delegate = self
+        menuTableView.registerForDraggedTypes([menuPasteboardType])
+        menuTableView.setDraggingSourceOperationMask(.move, forLocal: true)
+        menuTableView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = menuTableView
 
+        stack.addArrangedSubview(scrollView)
+        scrollView.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 560).isActive = true
+        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 460).isActive = true
+        scrollView.bottomAnchor.constraint(equalTo: stack.bottomAnchor).isActive = true
+        menuTableView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor).isActive = true
         return stack
     }
 
@@ -179,14 +221,13 @@ final class SettingsWindowController: NSWindowController {
         row.alignment = .centerY
         row.spacing = 10
 
-        let saveButton = NSButton(title: "Save", target: self, action: #selector(saveSettings))
-        saveButton.keyEquivalent = "\r"
-        saveButton.bezelStyle = .rounded
+        let revertButton = NSButton(title: "Revert", target: self, action: #selector(revertSettingsSession))
+        revertButton.bezelStyle = .rounded
 
         let resetButton = NSButton(title: "Reset Defaults", target: self, action: #selector(resetDefaults))
         resetButton.bezelStyle = .rounded
 
-        row.addArrangedSubview(saveButton)
+        row.addArrangedSubview(revertButton)
         row.addArrangedSubview(resetButton)
         return row
     }
@@ -208,36 +249,36 @@ final class SettingsWindowController: NSWindowController {
         let stack = NSStackView()
         stack.orientation = .horizontal
         stack.alignment = .centerY
+        stack.distribution = .fill
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
         return stack
     }
 
-    private func label(_ text: String, width: CGFloat) -> NSTextField {
+    private func label(_ text: String) -> NSTextField {
         let field = NSTextField(labelWithString: text)
         field.font = .systemFont(ofSize: 12)
         field.textColor = .secondaryLabelColor
-        field.alignment = .right
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.widthAnchor.constraint(equalToConstant: width).isActive = true
-        return field
-    }
-
-    private func field(_ value: String, width: CGFloat, placeholder: String = "") -> NSTextField {
-        let field = NSTextField(string: value)
-        field.placeholderString = placeholder
-        field.font = .systemFont(ofSize: 12)
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.widthAnchor.constraint(equalToConstant: width).isActive = true
         return field
     }
 
     @objc private func saveSettings() {
-        syncGeneralFields()
+        autosaveWorkItem?.cancel()
+        autosaveWorkItem = nil
+        stageCurrentSettings(status: "Saved.", normalizeMeterField: true)
+        persistCurrentSettings()
+    }
+
+    private func stageCurrentSettings(status: String, normalizeMeterField: Bool = false) {
+        syncGeneralFields(normalizeMeterField: normalizeMeterField)
         configuration.channels = []
         configuration.specials = []
         configuration.controlSections = currentMenuSections()
+        postStagedConfigurationChange()
+        statusLabel.stringValue = status
+    }
 
+    private func persistCurrentSettings() {
         do {
             try LoginItemManager.setEnabled(configuration.launchAtLogin)
         } catch {
@@ -247,19 +288,55 @@ final class SettingsWindowController: NSWindowController {
         }
 
         PreferencesStore.shared.save(configuration)
-        statusLabel.stringValue = "Saved."
+    }
+
+    private func postStagedConfigurationChange() {
+        NotificationCenter.default.post(name: .appConfigurationDidChange, object: configuration)
+    }
+
+    private func scheduleAutosave(delay: TimeInterval = 0.45, normalizeMeterField: Bool = false) {
+        guard !isPopulatingFields else {
+            return
+        }
+
+        autosaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.autosaveWorkItem = nil
+                self?.stageCurrentSettings(
+                    status: "Autosaved for this settings session.",
+                    normalizeMeterField: normalizeMeterField
+                )
+            }
+        }
+        autosaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     @objc private func resetDefaults() {
+        autosaveWorkItem?.cancel()
+        autosaveWorkItem = nil
         configuration = .defaults
-        PreferencesStore.shared.save(configuration)
-        rebuildEditableSections()
+        reloadMenuItemsFromConfiguration()
+        populateGeneralFields()
+        stageCurrentSettings(status: "Defaults staged for this settings session.", normalizeMeterField: true)
+    }
+
+    @objc private func revertSettingsSession() {
+        autosaveWorkItem?.cancel()
+        autosaveWorkItem = nil
+        configuration = sessionBaselineConfiguration
+        reloadMenuItemsFromConfiguration()
+        populateGeneralFields()
+        postStagedConfigurationChange()
+        statusLabel.stringValue = "Reverted to the settings from when this window opened."
     }
 
     @objc private func launchAtLoginChanged(_ sender: NSButton) {
         statusLabel.stringValue = sender.state == .on
-            ? "Auto-start will be enabled when you save."
-            : "Auto-start will be disabled when you save."
+            ? "Auto-start will be enabled."
+            : "Auto-start will be disabled."
+        scheduleAutosave(delay: 0)
     }
 
     @objc private func scanMixerIO() {
@@ -296,8 +373,8 @@ final class SettingsWindowController: NSWindowController {
         client.scanControlSources(host: host) { [weak self] sources in
             guard let self else { return }
             self.configuration.controlSources = sources
-            PreferencesStore.shared.save(self.configuration)
-            self.rebuildEditableSections()
+            self.postStagedConfigurationChange()
+            self.reloadMenuItemsFromConfiguration()
 
             let count = sources.reduce(0) { $0 + $1.controls.count }
             self.statusLabel.stringValue = sources.isEmpty
@@ -307,143 +384,153 @@ final class SettingsWindowController: NSWindowController {
     }
 
     @objc private func addMenuSection() {
-        let row = MenuSectionRowControls(
-            section: MixerControlSectionConfig(title: "New Section", controls: []),
-            sources: configuration.controlSources
-        )
-        addMenuSectionRow(row)
+        menuItems.append(.section(MenuSectionListItem(title: "New Section", isEnabled: true)))
+        reloadMenuTable(selecting: menuItems.count - 1)
+        scheduleAutosave(delay: 0)
     }
 
-    @objc private func deleteMenuSection(_ sender: NSButton) {
-        guard let index = menuSectionRows.firstIndex(where: { $0.deleteButton === sender }) else {
+    @objc private func addMenuControl() {
+        if menuItems.first(where: { $0.isSection }) == nil {
+            menuItems.append(.section(MenuSectionListItem(title: "Menu Section", isEnabled: true)))
+        }
+        menuItems.append(.control(defaultMenuControl()))
+        reloadMenuTable(selecting: menuItems.count - 1)
+        updateMenuLayoutSummary()
+        scheduleAutosave(delay: 0)
+    }
+
+    @objc private func editMenuItem(_ sender: NSButton) {
+        let row = menuTableView.row(for: sender)
+        guard menuItems.indices.contains(row) else {
             return
         }
-        let row = menuSectionRows.remove(at: index)
-        menuLayoutStack?.removeArrangedSubview(row.view)
-        row.view.removeFromSuperview()
-        ensureMenuEmptyState()
-        updateMenuLayoutSummary()
+        showEditor(forRow: row, relativeTo: sender)
     }
 
-    @objc private func addMenuElement(_ sender: NSButton) {
-        guard let row = menuSectionRows.first(where: { $0.addButton === sender }) else {
+    @objc private func deleteMenuItem(_ sender: NSButton) {
+        let row = menuTableView.row(for: sender)
+        guard menuItems.indices.contains(row) else {
             return
         }
-        let elementRow = MenuElementRowControls(control: defaultMenuControl(), sources: configuration.controlSources)
-        wireMenuElementRow(elementRow)
-        row.elementRows.append(elementRow)
-        row.view.addArrangedSubview(elementRow.view)
-        updateMenuLayoutSummary()
+        menuItems.remove(at: row)
+        reloadMenuTable(selecting: min(row, menuItems.count - 1))
+        scheduleAutosave(delay: 0)
     }
 
-    @objc private func deleteMenuElement(_ sender: NSButton) {
-        for sectionRow in menuSectionRows {
-            guard let index = sectionRow.elementRows.firstIndex(where: { $0.deleteButton === sender }) else {
-                continue
+    private func showEditor(forRow row: Int, relativeTo view: NSView) {
+        activePopover?.close()
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 480, height: 360)
+
+        switch menuItems[row] {
+        case .section(let section):
+            let editor = MenuSectionEditorViewController(section: section) { [weak self, weak popover] updated in
+                guard let self else { return }
+                self.menuItems[row] = .section(updated)
+                self.reloadMenuTable(selecting: row)
+                self.scheduleAutosave(delay: 0)
+                popover?.close()
             }
-            let element = sectionRow.elementRows.remove(at: index)
-            sectionRow.view.removeArrangedSubview(element.view)
-            element.view.removeFromSuperview()
-            updateMenuLayoutSummary()
-            return
+            popover.contentViewController = editor
+        case .control(let control):
+            let editor = MenuControlEditorViewController(
+                control: control,
+                sources: configuration.controlSources
+            ) { [weak self, weak popover] updated in
+                guard let self else { return }
+                self.menuItems[row] = .control(updated)
+                self.reloadMenuTable(selecting: row)
+                self.scheduleAutosave(delay: 0)
+                popover?.close()
+            }
+            popover.contentViewController = editor
         }
+
+        activePopover = popover
+        popover.show(relativeTo: view.bounds, of: view, preferredEdge: .maxX)
     }
 
-    @objc private func menuElementSourceChanged(_ sender: NSPopUpButton) {
-        guard let element = menuElementRow(containing: sender) else {
-            return
-        }
-        element.reloadControls(sources: configuration.controlSources)
-        element.applySelectedControl(sources: configuration.controlSources)
-    }
-
-    @objc private func menuElementControlChanged(_ sender: NSPopUpButton) {
-        guard let element = menuElementRow(containing: sender) else {
-            return
-        }
-        element.applySelectedControl(sources: configuration.controlSources)
-    }
-
-    private func wireMenuElementRow(_ row: MenuElementRowControls) {
-        row.sourcePopUp.target = self
-        row.sourcePopUp.action = #selector(menuElementSourceChanged(_:))
-        row.controlPopUp.target = self
-        row.controlPopUp.action = #selector(menuElementControlChanged(_:))
-        row.deleteButton.target = self
-        row.deleteButton.action = #selector(deleteMenuElement(_:))
-    }
-
-    private func addMenuSectionRow(_ row: MenuSectionRowControls) {
-        row.addButton.target = self
-        row.addButton.action = #selector(addMenuElement(_:))
-        row.deleteButton.target = self
-        row.deleteButton.action = #selector(deleteMenuSection(_:))
-        for elementRow in row.elementRows {
-            wireMenuElementRow(elementRow)
-        }
-        menuSectionRows.append(row)
-        removeMenuEmptyLabel()
-        menuLayoutStack?.addArrangedSubview(row.view)
+    private func populateGeneralFields() {
+        isPopulatingFields = true
+        hostField.stringValue = configuration.mixerHost
+        meterUpdateRateField.stringValue = Self.formatMeterUpdateRate(configuration.pollingInterval)
+        launchAtLoginButton.state = configuration.launchAtLogin ? .on : .off
         updateMenuLayoutSummary()
+        isPopulatingFields = false
+    }
+
+    private func reloadMenuItemsFromConfiguration() {
+        menuItems = configuration.controlSections.flatMap { section -> [MenuLayoutItem] in
+            [.section(MenuSectionListItem(id: section.id, title: section.title, isEnabled: section.isEnabled))]
+                + section.controls.map(MenuLayoutItem.control)
+        }
+        reloadMenuTable()
+    }
+
+    private func reloadMenuTable(selecting selectedRow: Int? = nil) {
+        menuTableView.reloadData()
+        updateMenuLayoutSummary()
+        guard let selectedRow, menuItems.indices.contains(selectedRow) else {
+            return
+        }
+        menuTableView.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
+        menuTableView.scrollRowToVisible(selectedRow)
     }
 
     private func updateMenuLayoutSummary() {
         let sourceControlCount = configuration.controlSources.reduce(0) { $0 + $1.controls.count }
-        let configuredControlCount = menuSectionRows.reduce(0) { $0 + $1.elementRows.count }
+        let sectionCount = menuItems.filter(\.isSection).count
+        let controlCount = menuItems.filter(\.isControl).count
         if configuration.controlSources.isEmpty {
-            menuSummaryLabel?.stringValue = configuredControlCount == 0
+            menuSummaryLabel.stringValue = controlCount == 0
                 ? "No control sources scanned. Scan sources, then add the sections and controls you want in the menu."
-                : "No control sources scanned. \(configuredControlCount) manual controls are currently placed in \(menuSectionRows.count) sections."
+                : "\(controlCount) manual controls are currently placed across \(sectionCount) sections."
         } else {
-            menuSummaryLabel?.stringValue = "\(configuration.controlSources.count) sources and \(sourceControlCount) controls available. \(configuredControlCount) controls are currently placed in \(menuSectionRows.count) sections."
+            menuSummaryLabel.stringValue = "\(configuration.controlSources.count) sources and \(sourceControlCount) controls available. \(controlCount) controls are currently placed across \(sectionCount) sections."
         }
-    }
-
-    private func ensureMenuEmptyState() {
-        if menuSectionRows.isEmpty {
-            guard menuEmptyLabel == nil else { return }
-            let emptyLabel = makeMenuLayoutEmptyLabel()
-            menuEmptyLabel = emptyLabel
-            menuLayoutStack?.addArrangedSubview(emptyLabel)
-        } else {
-            removeMenuEmptyLabel()
-        }
-    }
-
-    private func removeMenuEmptyLabel() {
-        guard let menuEmptyLabel else {
-            return
-        }
-        menuLayoutStack?.removeArrangedSubview(menuEmptyLabel)
-        menuEmptyLabel.removeFromSuperview()
-        self.menuEmptyLabel = nil
-    }
-
-    private func makeMenuLayoutEmptyLabel() -> NSTextField {
-        let emptyLabel = NSTextField(labelWithString: "No menu sections yet.")
-        emptyLabel.textColor = .tertiaryLabelColor
-        emptyLabel.font = .systemFont(ofSize: 11)
-        return emptyLabel
-    }
-
-    private func menuElementRow(containing popUp: NSPopUpButton) -> MenuElementRowControls? {
-        for sectionRow in menuSectionRows {
-            if let elementRow = sectionRow.elementRows.first(where: { $0.sourcePopUp === popUp || $0.controlPopUp === popUp }) {
-                return elementRow
-            }
-        }
-        return nil
     }
 
     private func currentMenuSections() -> [MixerControlSectionConfig] {
-        menuSectionRows.map { $0.sectionConfig(sources: configuration.controlSources) }
+        var sections: [MixerControlSectionConfig] = []
+        var currentSection: MixerControlSectionConfig?
+
+        func appendCurrentSection() {
+            if let currentSection {
+                sections.append(currentSection)
+            }
+        }
+
+        for item in menuItems {
+            switch item {
+            case .section(let section):
+                appendCurrentSection()
+                currentSection = MixerControlSectionConfig(
+                    id: section.id,
+                    title: section.title.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Menu Section",
+                    isEnabled: section.isEnabled,
+                    controls: []
+                )
+            case .control(let control):
+                if currentSection == nil {
+                    currentSection = MixerControlSectionConfig(title: "Menu Section", controls: [])
+                }
+                currentSection?.controls.append(control)
+            }
+        }
+
+        appendCurrentSection()
+        return sections
     }
 
-    private func syncGeneralFields() {
+    private func syncGeneralFields(normalizeMeterField: Bool = false) {
         configuration.mixerHost = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         configuration.launchAtLogin = launchAtLoginButton.state == .on
         configuration.pollingInterval = Self.pollingInterval(fromMeterUpdateRate: meterUpdateRateField.stringValue)
-        meterUpdateRateField.stringValue = Self.formatMeterUpdateRate(configuration.pollingInterval)
+        if normalizeMeterField {
+            meterUpdateRateField.stringValue = Self.formatMeterUpdateRate(configuration.pollingInterval)
+        }
     }
 
     private static func pollingInterval(fromMeterUpdateRate value: String) -> TimeInterval {
@@ -468,33 +555,15 @@ final class SettingsWindowController: NSWindowController {
 
     private func defaultMenuControl() -> MixerControlConfig {
         if let source = configuration.controlSources.first, let control = source.controls.first {
-            return MixerControlConfig(
-                title: control.title,
-                kind: control.kind,
-                displayStyle: control.displayStyle,
-                sourceID: source.id,
-                controlID: control.controlID,
-                endpoint: control.endpoint,
-                linkedEndpoints: control.linkedEndpoints,
-                meterEndpoint: control.meterEndpoint,
-                linkedMeterEndpoints: control.linkedMeterEndpoints,
-                muteEndpoint: control.muteEndpoint,
-                linkedMuteEndpoints: control.linkedMuteEndpoints,
-                padEndpoint: control.padEndpoint,
-                linkedPadEndpoints: control.linkedPadEndpoints,
-                phantomEndpoint: control.phantomEndpoint,
-                linkedPhantomEndpoints: control.linkedPhantomEndpoints,
-                minValue: control.minValue,
-                maxValue: control.maxValue
-            )
+            return control.copyForMenu(sourceID: source.id)
         }
 
         return MixerControlConfig(
             title: "Manual Control",
             kind: .slider,
             displayStyle: .simpleFader,
-            sourceID: MenuElementRowControls.manualSourceID,
-            controlID: MenuElementRowControls.manualSliderControlID,
+            sourceID: MenuControlEditorViewController.manualSourceID,
+            controlID: MenuControlEditorViewController.manualSliderControlID,
             endpoint: ""
         )
     }
@@ -507,443 +576,528 @@ final class SettingsWindowController: NSWindowController {
         alert.runModal()
     }
 
-    @MainActor
-    private final class MenuSectionRowControls {
-        let id: UUID
-        let view: NSStackView
-        let enabledButton: NSButton
-        let titleField: NSTextField
-        let addButton: NSButton
-        let deleteButton: NSButton
-        var elementRows: [MenuElementRowControls] = []
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        menuItems.count
+    }
 
-        init(section: MixerControlSectionConfig, sources: [MixerControlSourceConfig]) {
-            id = section.id
-            view = NSStackView()
-            view.orientation = .vertical
-            view.alignment = .leading
-            view.spacing = 6
-            view.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        switch menuItems[row] {
+        case .section:
+            return 46
+        case .control:
+            return 58
+        }
+    }
 
-            let header = Self.horizontalStack()
-            enabledButton = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-            enabledButton.state = section.isEnabled ? .on : .off
-            enabledButton.translatesAutoresizingMaskIntoConstraints = false
-            enabledButton.widthAnchor.constraint(equalToConstant: 34).isActive = true
-
-            titleField = SettingsWindowController.makeTextField(section.title, width: 260)
-            addButton = NSButton(title: "Add Element", target: nil, action: nil)
-            addButton.bezelStyle = .rounded
-            deleteButton = NSButton(title: "Delete Section", target: nil, action: nil)
-            deleteButton.bezelStyle = .rounded
-
-            header.addArrangedSubview(enabledButton)
-            header.addArrangedSubview(titleField)
-            header.addArrangedSubview(addButton)
-            header.addArrangedSubview(deleteButton)
-            view.addArrangedSubview(header)
-
-            let labels = Self.horizontalStack()
-            labels.addArrangedSubview(Self.label("Source", width: 200))
-            labels.addArrangedSubview(Self.label("Control", width: 150))
-            labels.addArrangedSubview(Self.label("Menu Label", width: 150))
-            labels.addArrangedSubview(Self.label("Endpoint", width: 300))
-            labels.addArrangedSubview(Self.label("Min", width: 70))
-            labels.addArrangedSubview(Self.label("Max", width: 70))
-            labels.addArrangedSubview(Self.label("", width: 70))
-            view.addArrangedSubview(labels)
-
-            for control in section.controls {
-                let row = MenuElementRowControls(control: control, sources: sources)
-                elementRows.append(row)
-                view.addArrangedSubview(row.view)
-            }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard menuItems.indices.contains(row) else {
+            return nil
         }
 
-        func sectionConfig(sources: [MixerControlSourceConfig]) -> MixerControlSectionConfig {
-            MixerControlSectionConfig(
-                id: id,
-                title: titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Menu Section",
-                isEnabled: enabledButton.state == .on,
-                controls: elementRows.map { $0.controlConfig(sources: sources) }
-            )
+        switch menuItems[row] {
+        case .section(let section):
+            return makeSectionTableCell(section: section)
+        case .control(let control):
+            return makeControlTableCell(control: control)
+        }
+    }
+
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        let item = NSPasteboardItem()
+        item.setString("\(row)", forType: menuPasteboardType)
+        return item
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        validateDrop info: NSDraggingInfo,
+        proposedRow row: Int,
+        proposedDropOperation dropOperation: NSTableView.DropOperation
+    ) -> NSDragOperation {
+        tableView.setDropRow(row, dropOperation: .above)
+        return .move
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        acceptDrop info: NSDraggingInfo,
+        row targetRow: Int,
+        dropOperation: NSTableView.DropOperation
+    ) -> Bool {
+        guard let sourceString = info.draggingPasteboard.string(forType: menuPasteboardType),
+              let sourceRow = Int(sourceString),
+              menuItems.indices.contains(sourceRow) else {
+            return false
         }
 
-        private static func horizontalStack() -> NSStackView {
-            let stack = NSStackView()
-            stack.orientation = .horizontal
-            stack.alignment = .centerY
-            stack.spacing = 8
-            return stack
+        var adjustedTarget = targetRow
+        let item = menuItems.remove(at: sourceRow)
+        if sourceRow < adjustedTarget {
+            adjustedTarget -= 1
+        }
+        adjustedTarget = min(max(adjustedTarget, 0), menuItems.count)
+        menuItems.insert(item, at: adjustedTarget)
+        reloadMenuTable(selecting: adjustedTarget)
+        scheduleAutosave(delay: 0)
+        return true
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        scheduleAutosave()
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        scheduleAutosave(delay: 0, normalizeMeterField: true)
+    }
+
+    private func makeSectionTableCell(section: MenuSectionListItem) -> NSView {
+        let cell = NSTableCellView()
+        let row = rowStack()
+        row.edgeInsets = NSEdgeInsets(top: 4, left: 14, bottom: 4, right: 20)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(row)
+
+        let enabled = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+        enabled.state = section.isEnabled ? .on : .off
+        enabled.isEnabled = false
+        let title = NSTextField(labelWithString: section.title)
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.lineBreakMode = .byTruncatingTail
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let editButton = NSButton(title: "Edit", target: self, action: #selector(editMenuItem(_:)))
+        editButton.bezelStyle = .rounded
+        let deleteButton = NSButton(title: "Delete", target: self, action: #selector(deleteMenuItem(_:)))
+        deleteButton.bezelStyle = .rounded
+        let actions = rightAlignedMenuActions()
+        actions.addArrangedSubview(editButton)
+        actions.addArrangedSubview(deleteButton)
+
+        row.addArrangedSubview(NSTextField(labelWithString: "|||"))
+        row.addArrangedSubview(enabled)
+        row.addArrangedSubview(title)
+        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(actions)
+
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: cell.trailingAnchor),
+            row.topAnchor.constraint(equalTo: cell.topAnchor),
+            row.bottomAnchor.constraint(equalTo: cell.bottomAnchor)
+        ])
+        return cell
+    }
+
+    private func makeControlTableCell(control: MixerControlConfig) -> NSView {
+        let cell = NSTableCellView()
+        let row = rowStack()
+        row.edgeInsets = NSEdgeInsets(top: 5, left: 24, bottom: 5, right: 20)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(row)
+
+        let textStack = NSStackView()
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 2
+
+        let title = NSTextField(labelWithString: control.title)
+        title.font = .systemFont(ofSize: 13)
+        title.lineBreakMode = .byTruncatingTail
+        let detail = NSTextField(labelWithString: control.endpoint.isEmpty ? "No endpoint configured" : control.endpoint)
+        detail.font = .systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        detail.lineBreakMode = .byTruncatingMiddle
+        textStack.addArrangedSubview(title)
+        textStack.addArrangedSubview(detail)
+        textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let style = NSTextField(labelWithString: control.displayStyle.rawValue)
+        style.font = .systemFont(ofSize: 11)
+        style.textColor = .secondaryLabelColor
+        style.alignment = .right
+        style.translatesAutoresizingMaskIntoConstraints = false
+        style.widthAnchor.constraint(equalToConstant: 110).isActive = true
+
+        let editButton = NSButton(title: "Edit", target: self, action: #selector(editMenuItem(_:)))
+        editButton.bezelStyle = .rounded
+        let deleteButton = NSButton(title: "Delete", target: self, action: #selector(deleteMenuItem(_:)))
+        deleteButton.bezelStyle = .rounded
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let trailingControls = rightAlignedMenuActions()
+        trailingControls.addArrangedSubview(style)
+        trailingControls.addArrangedSubview(editButton)
+        trailingControls.addArrangedSubview(deleteButton)
+
+        row.addArrangedSubview(NSTextField(labelWithString: "|||"))
+        row.addArrangedSubview(textStack)
+        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(trailingControls)
+
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: cell.trailingAnchor),
+            row.topAnchor.constraint(equalTo: cell.topAnchor),
+            row.bottomAnchor.constraint(equalTo: cell.bottomAnchor)
+        ])
+        return cell
+    }
+
+    private func rightAlignedMenuActions() -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setContentHuggingPriority(.required, for: .horizontal)
+        stack.setContentCompressionResistancePriority(.required, for: .horizontal)
+        return stack
+    }
+
+    fileprivate struct MenuSectionListItem {
+        var id: UUID = UUID()
+        var title: String
+        var isEnabled: Bool
+    }
+
+    private enum MenuLayoutItem {
+        case section(MenuSectionListItem)
+        case control(MixerControlConfig)
+
+        var isSection: Bool {
+            if case .section = self { return true }
+            return false
         }
 
-        private static func label(_ text: String, width: CGFloat) -> NSTextField {
-            let field = NSTextField(labelWithString: text)
-            field.font = .systemFont(ofSize: 11)
-            field.textColor = .tertiaryLabelColor
-            field.alignment = .left
+        var isControl: Bool {
+            if case .control = self { return true }
+            return false
+        }
+    }
+}
+
+private extension NSUserInterfaceItemIdentifier {
+    static let menuItemColumn = NSUserInterfaceItemIdentifier("menuItemColumn")
+}
+
+@MainActor
+private final class MenuSectionEditorViewController: NSViewController {
+    private let titleField: NSTextField
+    private let enabledButton: NSButton
+    private let onApply: (SettingsWindowController.MenuSectionListItem) -> Void
+    private let sectionID: UUID
+
+    init(
+        section: SettingsWindowController.MenuSectionListItem,
+        onApply: @escaping (SettingsWindowController.MenuSectionListItem) -> Void
+    ) {
+        self.sectionID = section.id
+        self.titleField = NSTextField(string: section.title)
+        self.enabledButton = NSButton(checkboxWithTitle: "Show section in menu", target: nil, action: nil)
+        self.enabledButton.state = section.isEnabled ? .on : .off
+        self.onApply = onApply
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        let stack = editorStack(title: "Edit Section")
+        stack.addArrangedSubview(label("Title"))
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+        titleField.widthAnchor.constraint(equalToConstant: 390).isActive = true
+        stack.addArrangedSubview(titleField)
+        stack.addArrangedSubview(enabledButton)
+        let button = applyButton(action: #selector(apply))
+        button.target = self
+        stack.addArrangedSubview(button)
+        view = paddedEditorView(containing: stack)
+    }
+
+    @objc private func apply() {
+        onApply(SettingsWindowController.MenuSectionListItem(
+            id: sectionID,
+            title: titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Menu Section",
+            isEnabled: enabledButton.state == .on
+        ))
+    }
+}
+
+@MainActor
+private final class MenuControlEditorViewController: NSViewController {
+    static let manualSourceID = "__manual__"
+    static let manualSliderControlID = "__manual_slider__"
+    static let manualToggleControlID = "__manual_toggle__"
+
+    private let controlID: UUID
+    private let sources: [MixerControlSourceConfig]
+    private let sourcePopUp = NSPopUpButton()
+    private let controlPopUp = NSPopUpButton()
+    private let titleField: NSTextField
+    private let endpointField: NSTextField
+    private let minValueField: NSTextField
+    private let maxValueField: NSTextField
+    private let onApply: (MixerControlConfig) -> Void
+
+    init(
+        control: MixerControlConfig,
+        sources: [MixerControlSourceConfig],
+        onApply: @escaping (MixerControlConfig) -> Void
+    ) {
+        self.controlID = control.id
+        self.sources = sources
+        self.titleField = NSTextField(string: control.title)
+        self.endpointField = NSTextField(string: control.endpoint)
+        self.minValueField = NSTextField(string: Self.formatValue(control.minValue))
+        self.maxValueField = NSTextField(string: Self.formatValue(control.maxValue))
+        self.onApply = onApply
+        super.init(nibName: nil, bundle: nil)
+        reloadSources(selectedSourceID: control.sourceID)
+        reloadControls(selectedControlID: control.controlID, fallbackKind: control.kind)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        let stack = editorStack(title: "Edit Control")
+        stack.addArrangedSubview(label("Source"))
+        stack.addArrangedSubview(sourcePopUp)
+        stack.addArrangedSubview(label("Control"))
+        stack.addArrangedSubview(controlPopUp)
+        stack.addArrangedSubview(label("Menu label"))
+        stack.addArrangedSubview(titleField)
+        stack.addArrangedSubview(label("Endpoint"))
+        stack.addArrangedSubview(endpointField)
+
+        let rangeRow = NSStackView()
+        rangeRow.orientation = .horizontal
+        rangeRow.alignment = .centerY
+        rangeRow.spacing = 8
+        minValueField.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        maxValueField.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        rangeRow.addArrangedSubview(label("Min"))
+        rangeRow.addArrangedSubview(minValueField)
+        rangeRow.addArrangedSubview(label("Max"))
+        rangeRow.addArrangedSubview(maxValueField)
+        stack.addArrangedSubview(rangeRow)
+
+        let button = applyButton(action: #selector(apply))
+        button.target = self
+        stack.addArrangedSubview(button)
+        for field in [sourcePopUp, controlPopUp, titleField, endpointField] {
             field.translatesAutoresizingMaskIntoConstraints = false
-            field.widthAnchor.constraint(equalToConstant: width).isActive = true
-            return field
+            field.widthAnchor.constraint(equalToConstant: 390).isActive = true
+        }
+        view = paddedEditorView(containing: stack)
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        sourcePopUp.target = self
+        sourcePopUp.action = #selector(sourceChanged)
+        controlPopUp.target = self
+        controlPopUp.action = #selector(controlChanged)
+    }
+
+    @objc private func sourceChanged() {
+        reloadControls(selectedControlID: "", fallbackKind: .slider)
+        applySelectedCatalogControl()
+    }
+
+    @objc private func controlChanged() {
+        applySelectedCatalogControl()
+    }
+
+    @objc private func apply() {
+        onApply(controlConfig())
+    }
+
+    private func reloadSources(selectedSourceID: String) {
+        sourcePopUp.removeAllItems()
+        sourcePopUp.addItems(withTitles: sources.map(\.title) + ["Manual Endpoint"])
+        for (item, source) in zip(sourcePopUp.itemArray, sources) {
+            item.representedObject = source.id
+        }
+        sourcePopUp.lastItem?.representedObject = Self.manualSourceID
+
+        let targetSourceID = selectedSourceID.isEmpty ? Self.manualSourceID : selectedSourceID
+        if let item = sourcePopUp.itemArray.first(where: { ($0.representedObject as? String) == targetSourceID }) {
+            sourcePopUp.select(item)
+        } else if sources.isEmpty {
+            sourcePopUp.select(sourcePopUp.lastItem)
+        } else {
+            sourcePopUp.selectItem(at: 0)
         }
     }
 
-    @MainActor
-    private final class MenuElementRowControls {
-        static let manualSourceID = "__manual__"
-        static let manualSliderControlID = "__manual_slider__"
-        static let manualToggleControlID = "__manual_toggle__"
+    private func reloadControls(selectedControlID: String, fallbackKind: MixerControlKind) {
+        controlPopUp.removeAllItems()
 
-        let id: UUID
-        let view: NSStackView
-        let sourcePopUp: NSPopUpButton
-        let controlPopUp: NSPopUpButton
-        let titleField: NSTextField
-        let endpointField: NSTextField
-        let minValueField: NSTextField
-        let maxValueField: NSTextField
-        let deleteButton: NSButton
-
-        init(control: MixerControlConfig, sources: [MixerControlSourceConfig]) {
-            id = control.id
-            view = NSStackView()
-            view.orientation = .horizontal
-            view.alignment = .centerY
-            view.spacing = 8
-
-            sourcePopUp = NSPopUpButton()
-            sourcePopUp.translatesAutoresizingMaskIntoConstraints = false
-            sourcePopUp.widthAnchor.constraint(equalToConstant: 200).isActive = true
-
-            controlPopUp = NSPopUpButton()
-            controlPopUp.translatesAutoresizingMaskIntoConstraints = false
-            controlPopUp.widthAnchor.constraint(equalToConstant: 150).isActive = true
-
-            titleField = SettingsWindowController.makeTextField(control.title, width: 150)
-            endpointField = SettingsWindowController.makeTextField(control.endpoint, width: 300, placeholder: "/datastore/...")
-            minValueField = SettingsWindowController.makeTextField(Self.formatValue(control.minValue), width: 70, placeholder: "0")
-            maxValueField = SettingsWindowController.makeTextField(Self.formatValue(control.maxValue), width: 70, placeholder: "1")
-
-            deleteButton = NSButton(title: "Delete", target: nil, action: nil)
-            deleteButton.bezelStyle = .rounded
-            deleteButton.translatesAutoresizingMaskIntoConstraints = false
-            deleteButton.widthAnchor.constraint(equalToConstant: 70).isActive = true
-
-            for controlView in [sourcePopUp, controlPopUp, titleField, endpointField, minValueField, maxValueField, deleteButton] {
-                view.addArrangedSubview(controlView)
+        if let source = selectedCatalogSource {
+            controlPopUp.addItems(withTitles: source.controls.map(\.title))
+            for (item, control) in zip(controlPopUp.itemArray, source.controls) {
+                item.representedObject = control.controlID
             }
-
-            reloadSources(sources: sources, selectedSourceID: control.sourceID)
-            reloadControls(sources: sources, selectedControlID: control.controlID, fallbackKind: control.kind)
+        } else {
+            controlPopUp.addItems(withTitles: ["Manual Fader", "Manual Toggle"])
+            controlPopUp.itemArray.first?.representedObject = Self.manualSliderControlID
+            controlPopUp.itemArray.dropFirst().first?.representedObject = Self.manualToggleControlID
         }
 
-        func reloadControls(sources: [MixerControlSourceConfig]) {
-            reloadControls(sources: sources, selectedControlID: selectedControlID, fallbackKind: .slider)
-        }
-
-        func applySelectedControl(sources: [MixerControlSourceConfig]) {
-            guard let control = selectedCatalogControl(sources: sources) else {
-                if titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    titleField.stringValue = selectedControlID == Self.manualToggleControlID ? "Manual Toggle" : "Manual Fader"
-                }
-                return
-            }
-
-            titleField.stringValue = control.title
-            endpointField.stringValue = control.endpoint
-            minValueField.stringValue = Self.formatValue(control.minValue)
-            maxValueField.stringValue = Self.formatValue(control.maxValue)
-        }
-
-        func controlConfig(sources: [MixerControlSourceConfig]) -> MixerControlConfig {
-            if let source = selectedCatalogSource(sources: sources),
-               let control = selectedCatalogControl(sources: sources) {
-                let range = configuredRange(fallbackMin: control.minValue, fallbackMax: control.maxValue)
-                return MixerControlConfig(
-                    id: id,
-                    title: titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? control.title,
-                    kind: control.kind,
-                    displayStyle: control.displayStyle,
-                    sourceID: source.id,
-                    controlID: control.controlID,
-                    endpoint: endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? control.endpoint,
-                    linkedEndpoints: control.linkedEndpoints,
-                    meterEndpoint: control.meterEndpoint,
-                    linkedMeterEndpoints: control.linkedMeterEndpoints,
-                    muteEndpoint: control.muteEndpoint,
-                    linkedMuteEndpoints: control.linkedMuteEndpoints,
-                    padEndpoint: control.padEndpoint,
-                    linkedPadEndpoints: control.linkedPadEndpoints,
-                    phantomEndpoint: control.phantomEndpoint,
-                    linkedPhantomEndpoints: control.linkedPhantomEndpoints,
-                    minValue: range.min,
-                    maxValue: range.max
-                )
-            }
-
-            let isToggle = selectedControlID == Self.manualToggleControlID
-            let range = configuredRange(fallbackMin: 0, fallbackMax: 1)
-            return MixerControlConfig(
-                id: id,
-                title: titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? (isToggle ? "Manual Toggle" : "Manual Fader"),
-                kind: isToggle ? .toggle : .slider,
-                displayStyle: isToggle ? .simpleToggle : .simpleFader,
-                sourceID: Self.manualSourceID,
-                controlID: isToggle ? Self.manualToggleControlID : Self.manualSliderControlID,
-                endpoint: endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                minValue: range.min,
-                maxValue: range.max
-            )
-        }
-
-        private var selectedSourceID: String {
-            sourcePopUp.selectedItem?.representedObject as? String ?? Self.manualSourceID
-        }
-
-        private var selectedControlID: String {
-            controlPopUp.selectedItem?.representedObject as? String ?? Self.manualSliderControlID
-        }
-
-        private func reloadSources(sources: [MixerControlSourceConfig], selectedSourceID: String) {
-            sourcePopUp.removeAllItems()
-            sourcePopUp.addItems(withTitles: sources.map(\.title) + ["Manual Endpoint"])
-            for (item, source) in zip(sourcePopUp.itemArray, sources) {
-                item.representedObject = source.id
-            }
-            sourcePopUp.lastItem?.representedObject = Self.manualSourceID
-
-            let targetSourceID = selectedSourceID.isEmpty ? Self.manualSourceID : selectedSourceID
-            if let item = sourcePopUp.itemArray.first(where: { ($0.representedObject as? String) == targetSourceID }) {
-                sourcePopUp.select(item)
-            } else if sources.isEmpty {
-                sourcePopUp.select(sourcePopUp.lastItem)
-            } else {
-                sourcePopUp.selectItem(at: 0)
-            }
-        }
-
-        private func reloadControls(
-            sources: [MixerControlSourceConfig],
-            selectedControlID: String,
-            fallbackKind: MixerControlKind
-        ) {
-            controlPopUp.removeAllItems()
-
-            if let source = selectedCatalogSource(sources: sources) {
-                controlPopUp.addItems(withTitles: source.controls.map(\.title))
-                for (item, control) in zip(controlPopUp.itemArray, source.controls) {
-                    item.representedObject = control.controlID
-                }
-            } else {
-                controlPopUp.addItems(withTitles: ["Manual Fader", "Manual Toggle"])
-                controlPopUp.itemArray.first?.representedObject = Self.manualSliderControlID
-                controlPopUp.itemArray.dropFirst().first?.representedObject = Self.manualToggleControlID
-            }
-
-            let fallbackID = fallbackKind == .toggle ? Self.manualToggleControlID : Self.manualSliderControlID
-            let targetControlID = selectedControlID.isEmpty ? fallbackID : selectedControlID
-            if let item = controlPopUp.itemArray.first(where: { ($0.representedObject as? String) == targetControlID }) {
-                controlPopUp.select(item)
-            } else {
-                controlPopUp.selectItem(at: 0)
-            }
-        }
-
-        private func selectedCatalogSource(sources: [MixerControlSourceConfig]) -> MixerControlSourceConfig? {
-            sources.first { $0.id == selectedSourceID }
-        }
-
-        private func selectedCatalogControl(sources: [MixerControlSourceConfig]) -> MixerControlConfig? {
-            selectedCatalogSource(sources: sources)?.controls.first { $0.controlID == selectedControlID }
-        }
-
-        private func configuredRange(fallbackMin: Double, fallbackMax: Double) -> (min: Double, max: Double) {
-            let parsedMin = Double(minValueField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? fallbackMin
-            let parsedMax = Double(maxValueField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? fallbackMax
-            guard parsedMin != parsedMax else {
-                return (fallbackMin, fallbackMax)
-            }
-            return (min(parsedMin, parsedMax), max(parsedMin, parsedMax))
-        }
-
-        private static func formatValue(_ value: Double) -> String {
-            if abs(value.rounded() - value) < 0.0001 {
-                return "\(Int(value.rounded()))"
-            }
-            return String(format: "%.4f", value)
+        let fallbackID = fallbackKind == .toggle ? Self.manualToggleControlID : Self.manualSliderControlID
+        let targetControlID = selectedControlID.isEmpty ? fallbackID : selectedControlID
+        if let item = controlPopUp.itemArray.first(where: { ($0.representedObject as? String) == targetControlID }) {
+            controlPopUp.select(item)
+        } else {
+            controlPopUp.selectItem(at: 0)
         }
     }
 
-    @MainActor
-    private final class ChannelRowControls {
-        let id: UUID
-        let view: NSStackView
-        let enabledButton: NSButton
-        let rolePopUp: NSPopUpButton
-        let nameField: NSTextField
-        let volumeEndpointField: NSTextField
-        let levelEndpointField: NSTextField
-        let muteEndpointField: NSTextField
-        let nameEndpointField: NSTextField
-        let scalePopUp: NSPopUpButton
-
-        init(channel: ChannelConfig) {
-            id = channel.id
-            view = NSStackView()
-            view.orientation = .horizontal
-            view.alignment = .centerY
-            view.spacing = 8
-
-            enabledButton = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-            enabledButton.state = channel.isEnabled ? .on : .off
-            enabledButton.translatesAutoresizingMaskIntoConstraints = false
-            enabledButton.widthAnchor.constraint(equalToConstant: 34).isActive = true
-
-            rolePopUp = NSPopUpButton()
-            rolePopUp.addItems(withTitles: ChannelRole.allCases.map(\.rawValue))
-            rolePopUp.selectItem(withTitle: channel.role.rawValue)
-            rolePopUp.translatesAutoresizingMaskIntoConstraints = false
-            rolePopUp.widthAnchor.constraint(equalToConstant: 105).isActive = true
-
-            nameField = SettingsWindowController.makeTextField(channel.displayName, width: 130)
-            volumeEndpointField = SettingsWindowController.makeTextField(channel.volumeEndpoint, width: 170, placeholder: "/datastore/...")
-            levelEndpointField = SettingsWindowController.makeTextField(channel.levelEndpoint, width: 170, placeholder: "/datastore/...")
-            muteEndpointField = SettingsWindowController.makeTextField(channel.muteEndpoint, width: 150, placeholder: "/path?value={value}")
-            nameEndpointField = SettingsWindowController.makeTextField(channel.nameEndpoint, width: 150, placeholder: "/datastore/.../name")
-
-            scalePopUp = NSPopUpButton()
-            scalePopUp.addItems(withTitles: SliderScale.allCases.map(\.rawValue))
-            scalePopUp.selectItem(withTitle: channel.sliderScale.rawValue)
-            scalePopUp.translatesAutoresizingMaskIntoConstraints = false
-            scalePopUp.widthAnchor.constraint(equalToConstant: 95).isActive = true
-
-            for control in [
-                enabledButton,
-                rolePopUp,
-                nameField,
-                volumeEndpointField,
-                levelEndpointField,
-                muteEndpointField,
-                nameEndpointField,
-                scalePopUp
-            ] {
-                view.addArrangedSubview(control)
+    private func applySelectedCatalogControl() {
+        guard let control = selectedCatalogControl else {
+            if titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                titleField.stringValue = selectedControlID == Self.manualToggleControlID ? "Manual Toggle" : "Manual Fader"
             }
+            return
         }
 
-        func channelConfig() -> ChannelConfig {
-            ChannelConfig(
-                id: id,
-                role: ChannelRole(rawValue: rolePopUp.titleOfSelectedItem ?? "") ?? .input,
-                displayName: nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                isEnabled: enabledButton.state == .on,
-                volumeEndpoint: volumeEndpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                levelEndpoint: levelEndpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                muteEndpoint: muteEndpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                supportsMute: (ChannelRole(rawValue: rolePopUp.titleOfSelectedItem ?? "") ?? .input) != .headphones,
-                nameEndpoint: nameEndpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                sliderScale: SliderScale(rawValue: scalePopUp.titleOfSelectedItem ?? "") ?? .logarithmic
-            )
-        }
+        titleField.stringValue = control.title
+        endpointField.stringValue = control.endpoint
+        minValueField.stringValue = Self.formatValue(control.minValue)
+        maxValueField.stringValue = Self.formatValue(control.maxValue)
     }
 
-    @MainActor
-    private final class SpecialRowControls {
-        let id: UUID
-        let view: NSStackView
-        let enabledButton: NSButton
-        let nameField: NSTextField
-        let setEndpointField: NSTextField
-        let stateEndpointField: NSTextField
-        let onValueField: NSTextField
-        let offValueField: NSTextField
-        let autoMediaButton: NSButton
-        let mediaAppsField: NSTextField
-        let mediaActionPopUp: NSPopUpButton
-        let deleteButton: NSButton
-
-        init(special: SpecialConfig) {
-            id = special.id
-            view = NSStackView()
-            view.orientation = .horizontal
-            view.alignment = .centerY
-            view.spacing = 8
-
-            enabledButton = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-            enabledButton.state = special.isEnabled ? .on : .off
-            enabledButton.translatesAutoresizingMaskIntoConstraints = false
-            enabledButton.widthAnchor.constraint(equalToConstant: 34).isActive = true
-
-            nameField = SettingsWindowController.makeTextField(special.name, width: 130)
-            setEndpointField = SettingsWindowController.makeTextField(special.setEndpoint, width: 190, placeholder: "/path?value={value}")
-            stateEndpointField = SettingsWindowController.makeTextField(special.stateEndpoint, width: 170, placeholder: "/datastore/...")
-            onValueField = SettingsWindowController.makeTextField(special.onValue, width: 70)
-            offValueField = SettingsWindowController.makeTextField(special.offValue, width: 70)
-
-            autoMediaButton = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-            autoMediaButton.state = special.autoToggleWithMedia ? .on : .off
-            autoMediaButton.translatesAutoresizingMaskIntoConstraints = false
-            autoMediaButton.widthAnchor.constraint(equalToConstant: 46).isActive = true
-
-            mediaAppsField = SettingsWindowController.makeTextField(
-                special.mediaAppIdentifiers.joined(separator: ", "),
-                width: 210,
-                placeholder: "Music, com.apple.TV"
-            )
-
-            mediaActionPopUp = NSPopUpButton()
-            mediaActionPopUp.addItems(withTitles: ["On", "Off"])
-            mediaActionPopUp.selectItem(withTitle: special.mediaTurnsSpecialOn ? "On" : "Off")
-            mediaActionPopUp.translatesAutoresizingMaskIntoConstraints = false
-            mediaActionPopUp.widthAnchor.constraint(equalToConstant: 92).isActive = true
-
-            deleteButton = NSButton(title: "Delete", target: nil, action: nil)
-            deleteButton.bezelStyle = .rounded
-            deleteButton.translatesAutoresizingMaskIntoConstraints = false
-            deleteButton.widthAnchor.constraint(equalToConstant: 70).isActive = true
-
-            for control in [
-                enabledButton,
-                nameField,
-                setEndpointField,
-                stateEndpointField,
-                onValueField,
-                offValueField,
-                autoMediaButton,
-                mediaAppsField,
-                mediaActionPopUp,
-                deleteButton
-            ] {
-                view.addArrangedSubview(control)
-            }
+    private func controlConfig() -> MixerControlConfig {
+        if let source = selectedCatalogSource, let control = selectedCatalogControl {
+            let range = configuredRange(fallbackMin: control.minValue, fallbackMax: control.maxValue)
+            var configured = control.copyForMenu(sourceID: source.id, id: controlID)
+            configured.title = titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? control.title
+            configured.endpoint = endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? control.endpoint
+            configured.minValue = range.min
+            configured.maxValue = range.max
+            return configured
         }
 
-        func specialConfig() -> SpecialConfig {
-            SpecialConfig(
-                id: id,
-                name: nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                isEnabled: enabledButton.state == .on,
-                setEndpoint: setEndpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                stateEndpoint: stateEndpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                onValue: onValueField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                offValue: offValueField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                autoToggleWithMedia: autoMediaButton.state == .on,
-                mediaAppIdentifiers: mediaAppsField.stringValue
-                    .split(separator: ",")
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty },
-                mediaTurnsSpecialOn: mediaActionPopUp.titleOfSelectedItem != "Off"
-            )
-        }
+        let isToggle = selectedControlID == Self.manualToggleControlID
+        let range = configuredRange(fallbackMin: 0, fallbackMax: 1)
+        return MixerControlConfig(
+            id: controlID,
+            title: titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? (isToggle ? "Manual Toggle" : "Manual Fader"),
+            kind: isToggle ? .toggle : .slider,
+            displayStyle: isToggle ? .simpleToggle : .simpleFader,
+            sourceID: Self.manualSourceID,
+            controlID: isToggle ? Self.manualToggleControlID : Self.manualSliderControlID,
+            endpoint: endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            minValue: range.min,
+            maxValue: range.max
+        )
     }
 
-    private static func makeTextField(_ value: String, width: CGFloat, placeholder: String = "") -> NSTextField {
-        let field = NSTextField(string: value)
-        field.placeholderString = placeholder
-        field.font = .systemFont(ofSize: 12)
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.widthAnchor.constraint(equalToConstant: width).isActive = true
-        return field
+    private var selectedSourceID: String {
+        sourcePopUp.selectedItem?.representedObject as? String ?? Self.manualSourceID
+    }
+
+    private var selectedControlID: String {
+        controlPopUp.selectedItem?.representedObject as? String ?? Self.manualSliderControlID
+    }
+
+    private var selectedCatalogSource: MixerControlSourceConfig? {
+        sources.first { $0.id == selectedSourceID }
+    }
+
+    private var selectedCatalogControl: MixerControlConfig? {
+        selectedCatalogSource?.controls.first { $0.controlID == selectedControlID }
+    }
+
+    private func configuredRange(fallbackMin: Double, fallbackMax: Double) -> (min: Double, max: Double) {
+        let parsedMin = Double(minValueField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? fallbackMin
+        let parsedMax = Double(maxValueField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? fallbackMax
+        guard parsedMin != parsedMax else {
+            return (fallbackMin, fallbackMax)
+        }
+        return (min(parsedMin, parsedMax), max(parsedMin, parsedMax))
+    }
+
+    private static func formatValue(_ value: Double) -> String {
+        if abs(value.rounded() - value) < 0.0001 {
+            return "\(Int(value.rounded()))"
+        }
+        return String(format: "%.4f", value)
+    }
+}
+
+@MainActor
+private func editorStack(title: String) -> NSStackView {
+    let stack = NSStackView()
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 8
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    let titleLabel = NSTextField(labelWithString: title)
+    titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+    stack.addArrangedSubview(titleLabel)
+    return stack
+}
+
+@MainActor
+private func paddedEditorView(containing stack: NSStackView) -> NSView {
+    let container = NSView()
+    container.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(stack)
+    NSLayoutConstraint.activate([
+        stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 24),
+        stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -24),
+        stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 22),
+        stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -22)
+    ])
+    return container
+}
+
+@MainActor
+private func label(_ text: String) -> NSTextField {
+    let field = NSTextField(labelWithString: text)
+    field.font = .systemFont(ofSize: 12)
+    field.textColor = .secondaryLabelColor
+    return field
+}
+
+@MainActor
+private func applyButton(action: Selector) -> NSButton {
+    let button = NSButton(title: "Apply", target: nil, action: action)
+    button.bezelStyle = .rounded
+    button.keyEquivalent = "\r"
+    return button
+}
+
+private extension MixerControlConfig {
+    func copyForMenu(sourceID: String, id: UUID = UUID()) -> MixerControlConfig {
+        MixerControlConfig(
+            id: id,
+            title: title,
+            kind: kind,
+            displayStyle: displayStyle,
+            sourceID: sourceID,
+            controlID: controlID,
+            endpoint: endpoint,
+            linkedEndpoints: linkedEndpoints,
+            meterEndpoint: meterEndpoint,
+            linkedMeterEndpoints: linkedMeterEndpoints,
+            muteEndpoint: muteEndpoint,
+            linkedMuteEndpoints: linkedMuteEndpoints,
+            padEndpoint: padEndpoint,
+            linkedPadEndpoints: linkedPadEndpoints,
+            phantomEndpoint: phantomEndpoint,
+            linkedPhantomEndpoints: linkedPhantomEndpoints,
+            minValue: minValue,
+            maxValue: maxValue
+        )
     }
 }
 
