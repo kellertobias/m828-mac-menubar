@@ -18,14 +18,19 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14 # GitHub-hosted Apple Silicon (arm64)
+    runs-on: macos-15 # GitHub-hosted Apple Silicon (arm64) with Xcode 16 / Swift 6
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Swift toolchain
-        run: swift --version
+      - name: Select latest Xcode (Package.swift needs Swift 6 tools)
+        run: |
+          set -euo pipefail
+          latest="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          echo "Selecting $latest"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          swift --version
 
       - name: Build and package the app (universal arm64 + x86_64)
         env:
